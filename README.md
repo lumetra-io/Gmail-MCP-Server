@@ -232,13 +232,29 @@ Creates a draft email without sending it.
 ```
 
 ### 3. Read Email (`read_email`)
-Retrieves the content of a specific email by its ID.
+Retrieves the content of a specific email by its ID with options to control response size.
 
 ```json
 {
-  "messageId": "182ab45cd67ef"
+  "messageId": "182ab45cd67ef",
+  "includeAttachments": true,
+  "includeHtml": true,
+  "maxBodyLength": 10000,
+  "format": "full"
 }
 ```
+
+**Parameters:**
+- `messageId` (required): ID of the email message to retrieve
+- `includeAttachments` (optional): Whether to include attachment information (default: true)
+- `includeHtml` (optional): Whether to include HTML content (default: true)
+- `maxBodyLength` (optional): Maximum length of body content to return (truncates if exceeded)
+- `format` (optional): Response format options:
+  - `"full"` (default): Complete email with all content
+  - `"summary"`: Key information with 500-character body preview
+  - `"headers_only"`: Only email headers without body content
+
+This helps prevent token limit errors when reading large emails with attachments or extensive HTML content.
 
 ### 4. Search Emails (`search_emails`)
 Searches for emails using Gmail search syntax.
