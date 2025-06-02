@@ -201,6 +201,10 @@ const SendEmailSchema = z.object({
 
 const ReadEmailSchema = z.object({
     messageId: z.string().describe("ID of the email message to retrieve"),
+    includeAttachments: z.boolean().optional().default(true).describe("Whether to include attachment information (default: true)"),
+    includeHtml: z.boolean().optional().default(true).describe("Whether to include HTML content (default: true)"),
+    maxBodyLength: z.number().optional().describe("Maximum length of body content to return (truncates if exceeded)"),
+    format: z.enum(['full', 'summary', 'headers_only']).optional().default('full').describe("Response format: 'full' (complete email), 'summary' (key info only), 'headers_only' (no body)")
 });
 
 const SearchEmailsSchema = z.object({
@@ -465,39 +469,78 @@ async function main() {
                     const date = headers.find(h => h.name?.toLowerCase() === 'date')?.value || '';
                     const threadId = response.data.threadId || '';
 
+                    // Headers only mode - return just headers
+                    if (validatedArgs.format === 'headers_only') {
+                        return {
+                            content: [
+                                {
+                                    type: "text",
+                                    text: `Thread ID: ${threadId}\nSubject: ${subject}\nFrom: ${from}\nTo: ${to}\nDate: ${date}`,
+                                },
+                            ],
+                        };
+                    }
+
                     // Extract email content using the recursive function
                     const { text, html } = extractEmailContent(response.data.payload as GmailMessagePart || {});
 
-                    // Use plain text content if available, otherwise use HTML content
-                    // (optionally, you could implement HTML-to-text conversion here)
-                    let body = text || html || '';
+                    // Use plain text content if available, otherwise use HTML content based on includeHtml flag
+                    let body = text || '';
+                    if (!text && html && validatedArgs.includeHtml) {
+                        body = html;
+                    }
+
+                    // Truncate body if maxBodyLength is specified
+                    let truncated = false;
+                    if (validatedArgs.maxBodyLength && body.length > validatedArgs.maxBodyLength) {
+                        body = body.substring(0, validatedArgs.maxBodyLength);
+                        truncated = true;
+                    }
 
                     // If we only have HTML content, add a note for the user
-                    const contentTypeNote = !text && html ?
+                    const contentTypeNote = !text && html && validatedArgs.includeHtml ?
                         '[Note: This email is HTML-formatted. Plain text version not available.]\n\n' : '';
 
-                    // Get attachment information
+                    // Get attachment information if requested
                     const attachments: EmailAttachment[] = [];
-                    const processAttachmentParts = (part: GmailMessagePart, path: string = '') => {
-                        if (part.body && part.body.attachmentId) {
-                            const filename = part.filename || `attachment-${part.body.attachmentId}`;
-                            attachments.push({
-                                id: part.body.attachmentId,
-                                filename: filename,
-                                mimeType: part.mimeType || 'application/octet-stream',
-                                size: part.body.size || 0
-                            });
-                        }
+                    if (validatedArgs.includeAttachments) {
+                        const processAttachmentParts = (part: GmailMessagePart, path: string = '') => {
+                            if (part.body && part.body.attachmentId) {
+                                const filename = part.filename || `attachment-${part.body.attachmentId}`;
+                                attachments.push({
+                                    id: part.body.attachmentId,
+                                    filename: filename,
+                                    mimeType: part.mimeType || 'application/octet-stream',
+                                    size: part.body.size || 0
+                                });
+                            }
 
-                        if (part.parts) {
-                            part.parts.forEach((subpart: GmailMessagePart) =>
-                                processAttachmentParts(subpart, `${path}/parts`)
-                            );
-                        }
-                    };
+                            if (part.parts) {
+                                part.parts.forEach((subpart: GmailMessagePart) =>
+                                    processAttachmentParts(subpart, `${path}/parts`)
+                                );
+                            }
+                        };
 
-                    if (response.data.payload) {
-                        processAttachmentParts(response.data.payload as GmailMessagePart);
+                        if (response.data.payload) {
+                            processAttachmentParts(response.data.payload as GmailMessagePart);
+                        }
+                    }
+
+                    // Summary mode - extract key information only
+                    if (validatedArgs.format === 'summary') {
+                        const summaryBody = body.substring(0, 500) + (body.length > 500 ? '...' : '');
+                        const attachmentSummary = attachments.length > 0 ? 
+                            `\nAttachments: ${attachments.length} file(s)` : '';
+                        
+                        return {
+                            content: [
+                                {
+                                    type: "text",
+                                    text: `Subject: ${subject}\nFrom: ${from}\nDate: ${date}\n\nPreview: ${summaryBody}${attachmentSummary}`,
+                                },
+                            ],
+                        };
                     }
 
                     // Add attachment info to output if any are present
@@ -505,11 +548,15 @@ async function main() {
                         `\n\nAttachments (${attachments.length}):\n` +
                         attachments.map(a => `- ${a.filename} (${a.mimeType}, ${Math.round(a.size/1024)} KB)`).join('\n') : '';
 
+                    // Add truncation notice if applicable
+                    const truncationNotice = truncated ? 
+                        `\n\n[Note: Body content truncated to ${validatedArgs.maxBodyLength} characters]` : '';
+
                     return {
                         content: [
                             {
                                 type: "text",
-                                text: `Thread ID: ${threadId}\nSubject: ${subject}\nFrom: ${from}\nTo: ${to}\nDate: ${date}\n\n${contentTypeNote}${body}${attachmentInfo}`,
+                                text: `Thread ID: ${threadId}\nSubject: ${subject}\nFrom: ${from}\nTo: ${to}\nDate: ${date}\n\n${contentTypeNote}${body}${attachmentInfo}${truncationNotice}`,
                             },
                         ],
                     };
