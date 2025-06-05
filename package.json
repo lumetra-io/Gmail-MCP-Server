@@ -1,6 +1,6 @@
 {
-  "name": "@gongrzhe/server-gmail-autoauth-mcp",
-  "version": "1.1.9",
+  "name": "@sudomcp/server-gmail-autoauth-mcp",
+  "version": "1.2.0",
   "description": "Gmail MCP server with auto authentication support",
   "type": "module",
   "main": "dist/index.js",
