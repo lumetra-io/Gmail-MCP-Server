@@ -177,6 +177,14 @@ npx @gongrzhe/server-gmail-autoauth-mcp auth https://gmail.gongrzhe.com/oauth2ca
 
 This approach allows authentication flows to work properly in environments where localhost isn't accessible, such as containerized applications or cloud servers.
 
+### MCP Server Hosting
+
+Services hosting this MCP server may wish to handle authentication independently. In this case, the access token may be provided by invoking the tool
+with the `host-auth` flag and assigning the token to the environment variable `GMAIL_API_ACCESS_TOKEN`:
+```sh
+GMAIL_API_ACCESS_TOKEN=XXXXX node dist/index.js --host-auth
+```
+
 ## Available Tools
 
 The server provides the following tools that can be used through Claude Desktop:
