@@ -92,6 +92,18 @@ function extractEmailContent(messagePart: GmailMessagePart): EmailContent {
     return { text: textContent, html: htmlContent };
 }
 
+async function getCredentialsFromHost() {
+  // MCP hosting backend provides access token as environment variable
+  if (!process.env.GMAIL_API_ACCESS_TOKEN) {
+    console.error("Missing access token. Only tools/list available");
+  }
+  oauth2Client = new OAuth2Client();
+  oauth2Client.setCredentials({
+    access_token: process.env.GMAIL_API_ACCESS_TOKEN,
+    scope: "https://www.googleapis.com/auth/gmail.modify",
+  });
+}
+
 async function loadCredentials() {
     try {
         // Create config directory if it doesn't exist
@@ -262,12 +274,15 @@ const BatchDeleteEmailsSchema = z.object({
 
 // Main function
 async function main() {
-    await loadCredentials();
-
-    if (process.argv[2] === 'auth') {
-        await authenticate();
-        console.log('Authentication completed successfully');
-        process.exit(0);
+    if (process.argv[2] === "--host-auth") {
+        await getCredentialsFromHost();
+    } else {
+        await loadCredentials();
+        if (process.argv[2] === 'auth') {
+            await authenticate();
+            console.log('Authentication completed successfully');
+            process.exit(0);
+        }
     }
 
     // Initialize Gmail API
