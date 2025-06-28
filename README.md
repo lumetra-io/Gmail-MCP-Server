@@ -27,6 +27,9 @@ A Model Context Protocol (MCP) server for Gmail integration in Claude Desktop wi
 - Simple OAuth2 authentication flow with auto browser launch
 - Support for both Desktop and Web application credentials
 - Global credential storage for convenience
+- **Multiple transport modes**: Stdio, HTTP (Streamable), and SSE
+- **Official MCP SDK integration** with proper protocol compliance
+- **Session management** for HTTP/SSE transports
 
 ## Installation & Authentication
 
@@ -499,6 +502,92 @@ The server includes efficient batch processing capabilities:
    - **Permission Errors**: Check that the server has read access to attachment files
    - **Size Limits**: Gmail has a 25MB attachment size limit per email
    - **Download Failures**: Verify you have write permissions to the download directory
+
+## Transport Modes
+
+The Gmail MCP Server supports multiple transport modes for different integration scenarios:
+
+### 1. Standard Stdio Transport (Default)
+The default transport mode for MCP client integration via stdin/stdout:
+
+```bash
+# Run with default stdio transport
+npm start
+# or
+node dist/index.js
+```
+
+### 2. HTTP Transport (Streamable HTTP)
+Modern MCP Streamable HTTP transport (protocol version 2025-03-26) for web applications and direct integration:
+
+```bash
+# Run with HTTP transport
+npm run start:http
+# or
+node dist/index.js --http
+```
+
+The HTTP server provides the following endpoints:
+
+- **ALL /mcp** - MCP Streamable HTTP endpoint (supports GET, POST, DELETE)
+- **GET /health** - Health check endpoint  
+- **GET /** - API documentation and usage examples
+
+#### Example HTTP Usage:
+
+```bash
+# Initialize a new MCP session
+curl -X POST http://localhost:3000/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize",
+    "params": {
+      "protocolVersion": "2024-11-05",
+      "capabilities": {"tools": {}},
+      "clientInfo": {"name": "test-client", "version": "1.0.0"}
+    }
+  }'
+
+# The response will include a session ID for subsequent requests
+# Use the mcp-session-id header for follow-up requests
+
+# Check server health
+curl http://localhost:3000/health
+```
+
+**Note**: This implementation uses the official MCP SDK's `StreamableHTTPServerTransport` for full protocol compliance and session management.
+
+### 3. SSE Transport (Server-Sent Events) 
+Legacy transport mode for backwards compatibility (protocol version 2024-11-05):
+
+```bash
+# Run with SSE transport
+npm run start:sse
+# or
+node dist/index.js --sse
+```
+
+The SSE server provides the following endpoints:
+
+- **GET /sse** - SSE connection endpoint
+- **POST /messages** - Message handling endpoint  
+- **GET /health** - Health check endpoint
+
+**Note**: This implementation uses the official MCP SDK's `SSEServerTransport`. SSE transport is deprecated in favor of Streamable HTTP.
+
+### Transport Configuration
+
+- **Port**: Set the `PORT` environment variable (default: 3000)
+- **CORS**: HTTP transport includes CORS headers for web browser compatibility
+- **Authentication**: All transport modes use the same OAuth2 authentication flow
+
+#### Environment Variables:
+```bash
+PORT=8080 npm run start:http  # Run HTTP transport on port 8080
+```
 
 ## Contributing
 
