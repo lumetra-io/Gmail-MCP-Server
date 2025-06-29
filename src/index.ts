@@ -178,6 +178,71 @@ async function loadCredentials(storagePath?: string, sessionId?: string): Promis
     }
 }
 
+async function startAuthServer(sessionOauth2Client: OAuth2Client, sessionCredentialsPath: string, sessionId: string): Promise<string> {
+    const callbackUrl = (sessionOauth2Client as any).redirectUri || (sessionOauth2Client as any)._opts?.redirectUri;
+    if (!callbackUrl) {
+        throw new Error("OAuth2 Client is not configured with a callback URL.");
+    }
+
+    const parsedUrl = new URL(callbackUrl);
+    const port = parsedUrl.port;
+
+    if (!port) {
+        throw new Error("Callback URL must have a port specified (e.g., http://localhost:3000).");
+    }
+
+    const server = http.createServer();
+    // Always bind to 0.0.0.0 to allow Docker port mapping to work
+    server.listen(parseInt(port, 10), '0.0.0.0');
+
+    // Store the pending auth details
+    pendingAuthStore.set(sessionId, { 
+        oauth2Client: sessionOauth2Client, 
+        server: server,
+        callbackUrl: callbackUrl
+    });
+
+    const authUrl = sessionOauth2Client.generateAuthUrl({
+        access_type: 'offline',
+        scope: ['https://www.googleapis.com/auth/gmail.modify'],
+    });
+
+    // Set up the server to handle the callback
+    server.on('request', async (req, res) => {
+        // Only handle requests to the specified callback path
+        if (!req.url || !req.url.startsWith(parsedUrl.pathname)) {
+            res.writeHead(404);
+            res.end('Not Found');
+            return;
+        }
+
+        const url = new URL(req.url, callbackUrl);
+        const code = url.searchParams.get('code');
+
+        if (!code) {
+            res.writeHead(400);
+            res.end('No code provided');
+            return;
+        }
+
+        try {
+            const { tokens } = await sessionOauth2Client.getToken(code);
+            sessionOauth2Client.setCredentials(tokens);
+            fs.writeFileSync(sessionCredentialsPath, JSON.stringify(tokens));
+
+            res.writeHead(200);
+            res.end('Authentication successful! You can close this window.');
+            
+            // Clean up - server will be closed when check_authentication is called
+        } catch (error) {
+            res.writeHead(500);
+            res.end('Authentication failed');
+        }
+    });
+
+    return authUrl;
+}
+
 async function authenticate(sessionOauth2Client: OAuth2Client, sessionCredentialsPath: string) {
     const callbackUrl = (sessionOauth2Client as any).redirectUri || (sessionOauth2Client as any)._opts?.redirectUri;
     if (!callbackUrl) {
@@ -192,7 +257,8 @@ async function authenticate(sessionOauth2Client: OAuth2Client, sessionCredential
     }
 
     const server = http.createServer();
-    server.listen(parseInt(port, 10), parsedUrl.hostname);
+    // Always bind to 0.0.0.0 to allow Docker port mapping to work
+    server.listen(parseInt(port, 10), '0.0.0.0');
 
     return new Promise<void>((resolve, reject) => {
         const authUrl = sessionOauth2Client.generateAuthUrl({
@@ -333,14 +399,29 @@ const DownloadAttachmentSchema = z.object({
     savePath: z.string().optional().describe("Directory path to save the attachment (defaults to current directory)"),
 });
 
-// Schema for authentication setup
+// Schema for getting authentication URL
+const GetAuthUrlSchema = z.object({
+    clientId: z.string().describe("Your Google Cloud OAuth Client ID"),
+    clientSecret: z.string().describe("Your Google Cloud OAuth Client Secret"),
+    callbackUrl: z.string().optional().default("http://localhost:3456/oauth2callback").describe("The OAuth2 callback URL. Defaults to http://localhost:3456/oauth2callback"),
+    storagePath: z.string().optional().default(path.join(os.homedir(), '.gmail-mcp')).describe("The directory to store authentication files. Defaults to ~/.gmail-mcp"),
+    userId: z.string().optional().describe("Optional user identifier for multi-user setups. If provided, credentials will be stored separately for this user."),
+}).describe("Sets up OAuth configuration and returns authentication URL.");
+
+// Schema for checking authentication status
+const CheckAuthenticationSchema = z.object({
+    userId: z.string().optional().describe("Optional user identifier for multi-user setups. Must match the userId used in get_auth_url."),
+    storagePath: z.string().optional().default(path.join(os.homedir(), '.gmail-mcp')).describe("The directory where authentication files are stored. Must match the storagePath used in get_auth_url."),
+}).describe("Checks if authentication is complete and returns session token if successful.");
+
+// Keep the original schema for backward compatibility
 const SetupAuthenticationSchema = z.object({
     clientId: z.string().describe("Your Google Cloud OAuth Client ID"),
     clientSecret: z.string().describe("Your Google Cloud OAuth Client Secret"),
     callbackUrl: z.string().optional().default("http://localhost:3456/oauth2callback").describe("The OAuth2 callback URL. Defaults to http://localhost:3456/oauth2callback"),
     storagePath: z.string().optional().default(path.join(os.homedir(), '.gmail-mcp')).describe("The directory to store authentication files. Defaults to ~/.gmail-mcp"),
     userId: z.string().optional().describe("Optional user identifier for multi-user setups. If provided, credentials will be stored separately for this user."),
-}).describe("Sets up and performs authentication with Google Cloud OAuth.");
+}).describe("Sets up and performs authentication with Google Cloud OAuth (legacy - use get_auth_url + check_authentication instead).");
 
 // Schema for token-based authentication
 const AuthenticateWithTokenSchema = z.object({
@@ -358,6 +439,7 @@ interface SessionData {
 
 const sessionStore = new Map<string, SessionData>();
 const tokenToSessionMap = new Map<string, string>(); // Maps tokens to session IDs
+const pendingAuthStore = new Map<string, { oauth2Client: OAuth2Client; server: http.Server; userId?: string; callbackUrl: string }>(); // Stores pending OAuth clients
 
 // Global variable to track current request context (temporary solution)
 let currentRequestContext: { mcpSessionId?: string; authSessionId?: string } = {};
@@ -775,8 +857,18 @@ async function main() {
                 inputSchema: zodToJsonSchema(DownloadAttachmentSchema),
             },
             {
+                name: "get_auth_url",
+                description: "Sets up OAuth configuration and returns authentication URL for user to visit",
+                inputSchema: zodToJsonSchema(GetAuthUrlSchema),
+            },
+            {
+                name: "check_authentication",
+                description: "Checks if authentication is complete and returns session token if successful",
+                inputSchema: zodToJsonSchema(CheckAuthenticationSchema),
+            },
+            {
                 name: "setup_authentication",
-                description: "Sets up and performs authentication with Google Cloud OAuth",
+                description: "Sets up and performs authentication with Google Cloud OAuth (legacy - use get_auth_url + check_authentication instead)",
                 inputSchema: zodToJsonSchema(SetupAuthenticationSchema),
             },
             {
@@ -798,8 +890,8 @@ async function main() {
         return asyncLocalStorage.run({ gmail: null, oauth2Client: null, sessionId: authSessionId }, async () => {
             const { name, arguments: args } = request.params;
 
-            // For all tools except setup_authentication and authenticate_with_token, ensure we have a gmail client
-            if (name !== 'setup_authentication' && name !== 'authenticate_with_token') {
+            // For all tools except authentication tools, ensure we have a gmail client
+            if (name !== 'setup_authentication' && name !== 'authenticate_with_token' && name !== 'get_auth_url' && name !== 'check_authentication') {
                 const store = asyncLocalStorage.getStore();
                 let sessionOauth2Client: OAuth2Client | null = null;
                 let gmailClient: gmail_v1.Gmail | null = null;
@@ -1484,6 +1576,140 @@ async function main() {
                                 ],
                             };
                         }
+                    }
+
+                    case "get_auth_url": {
+                        const validatedArgs = GetAuthUrlSchema.parse(args);
+                        const store = asyncLocalStorage.getStore();
+
+                        // Use userId if provided, otherwise use the current auth session ID
+                        const userSessionId = validatedArgs.userId || store?.sessionId || authSessionId;
+
+                        console.log(`Setting up authentication URL for user session: ${userSessionId}`);
+
+                        // Update paths to use user/session-specific storage
+                        updatePaths(validatedArgs.storagePath, userSessionId);
+
+                        // 1. Create the gcp-oauth.keys.json file
+                        const oauthKeys = {
+                            web: {
+                                client_id: validatedArgs.clientId,
+                                client_secret: validatedArgs.clientSecret,
+                                redirect_uris: [validatedArgs.callbackUrl],
+                                auth_uri: "https://accounts.google.com/o/oauth2/auth",
+                                token_uri: "https://oauth2.googleapis.com/token",
+                                auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
+                            },
+                        };
+
+                        if (!fs.existsSync(CONFIG_DIR)) {
+                            fs.mkdirSync(CONFIG_DIR, { recursive: true });
+                        }
+
+                        fs.writeFileSync(OAUTH_PATH, JSON.stringify(oauthKeys, null, 2));
+
+                        // 2. Create session-specific oauth2Client
+                        const sessionOauth2Client = new OAuth2Client({
+                            clientId: validatedArgs.clientId,
+                            clientSecret: validatedArgs.clientSecret,
+                            redirectUri: validatedArgs.callbackUrl
+                        });
+
+                        // 3. Start the auth server and get the auth URL
+                        const authUrl = await startAuthServer(sessionOauth2Client, CREDENTIALS_PATH, authSessionId);
+
+                        return {
+                            content: [
+                                {
+                                    type: "text",
+                                    text: `🔗 Authentication URL ready!\\n\\n` +
+                                        `User: ${validatedArgs.userId || 'auto-detected'}\\n` +
+                                        `Session: ${authSessionId}\\n` +
+                                        `Callback URL: ${validatedArgs.callbackUrl}\\n\\n` +
+                                        `📋 Please visit this URL to authenticate:\\n${authUrl}\\n\\n` +
+                                        `⚠️  IMPORTANT: After completing authentication in your browser:\\n` +
+                                        `• Use the 'check_authentication' tool to complete the process\\n` +
+                                        `• The OAuth server is now listening for the callback\\n` +
+                                        `• Make sure to call check_authentication with the same userId/storagePath`,
+                                },
+                            ],
+                        };
+                    }
+
+                    case "check_authentication": {
+                        const validatedArgs = CheckAuthenticationSchema.parse(args);
+                        const store = asyncLocalStorage.getStore();
+
+                        // Use userId if provided, otherwise use the current auth session ID
+                        const userSessionId = validatedArgs.userId || store?.sessionId || authSessionId;
+
+                        console.log(`Checking authentication for user session: ${userSessionId}`);
+
+                        // Update paths to use user/session-specific storage
+                        updatePaths(validatedArgs.storagePath, userSessionId);
+
+                        // Check if we have a pending auth for this session
+                        const pendingAuth = pendingAuthStore.get(authSessionId);
+                        if (!pendingAuth) {
+                            return {
+                                content: [
+                                    {
+                                        type: "text",
+                                        text: `❌ No pending authentication found for session ${authSessionId}.\\n\\n` +
+                                            `Please call 'get_auth_url' first to initiate the authentication process.`,
+                                    },
+                                ],
+                            };
+                        }
+
+                        // Check if credentials file exists (means auth was completed)
+                        if (!fs.existsSync(CREDENTIALS_PATH)) {
+                            return {
+                                content: [
+                                    {
+                                        type: "text",
+                                        text: `⏳ Authentication not yet complete.\\n\\n` +
+                                            `Please complete the authentication process in your browser first.\\n` +
+                                            `If you haven't visited the auth URL yet, call 'get_auth_url' to get it again.`,
+                                    },
+                                ],
+                            };
+                        }
+
+                        // Authentication completed! Clean up and return session token
+                        const sessionOauth2Client = pendingAuth.oauth2Client;
+                        pendingAuth.server.close();
+                        pendingAuthStore.delete(authSessionId);
+
+                        // Initialize the Gmail API client
+                        const gmail = google.gmail({ version: 'v1', auth: sessionOauth2Client });
+
+                        // Store in session store
+                        const sessionToken = storeSessionData(authSessionId, sessionOauth2Client, gmail, validatedArgs.userId);
+
+                        if (store) {
+                            store.gmail = gmail;
+                            store.oauth2Client = sessionOauth2Client;
+                            store.sessionId = authSessionId;
+                            store.userId = validatedArgs.userId;
+                        }
+
+                        return {
+                            content: [
+                                {
+                                    type: "text",
+                                    text: `✅ Authentication completed successfully!\\n\\n` +
+                                        `User: ${validatedArgs.userId || 'auto-detected'}\\n` +
+                                        `Session: ${authSessionId}\\n\\n` +
+                                        `🔑 Your Session Token: ${sessionToken}\\n\\n` +
+                                        `⚠️  IMPORTANT: Save this token securely!\\n` +
+                                        `• Use this token to authenticate future requests\\n` +
+                                        `• Add 'sessionToken' parameter to your email requests\\n` +
+                                        `• Token expires in 24 hours\\n` +
+                                        `• Without this token, anonymous users cannot access your account`,
+                                },
+                            ],
+                        };
                     }
 
                     case "setup_authentication": {
