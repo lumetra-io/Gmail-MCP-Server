@@ -25,6 +25,7 @@ import crypto from 'crypto';
 import { createEmailMessage, createEmailWithNodemailer } from "./utl.js";
 import { createLabel, updateLabel, deleteLabel, listLabels, findLabelByName, getOrCreateLabel, GmailLabel } from "./label-manager.js";
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { SessionAwareTransportManager, RequestContext } from './session-aware-transport.js';
 
 // Define the shape of the context for each request
 interface AppContext {
@@ -41,6 +42,9 @@ const asyncLocalStorage = new AsyncLocalStorage<AppContext>();
 
 // Create a separate AsyncLocalStorage for request context to prevent race conditions
 const requestContextStorage = new AsyncLocalStorage<{ mcpSessionId: string; authSessionId: string }>();
+
+// Global session-aware transport manager
+let transportManager: SessionAwareTransportManager;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -446,36 +450,17 @@ const sessionStore = new Map<string, SessionData>();
 const tokenToSessionMap = new Map<string, string>(); // Maps tokens to session IDs
 const pendingAuthStore = new Map<string, { oauth2Client: OAuth2Client; server: http.Server; userId?: string; callbackUrl: string }>(); // Stores pending OAuth clients
 
-// Periodic cleanup of expired sessions (run every 30 minutes)
-function startSessionCleanup() {
-    setInterval(() => {
-        const now = Date.now();
-        const maxAge = 24 * 60 * 60 * 1000; // 24 hours
-        let cleanedCount = 0;
-
-        for (const [sessionId, sessionData] of sessionStore.entries()) {
-            const tokenAge = now - (sessionData.tokenCreatedAt?.getTime() || 0);
-            if (tokenAge > maxAge) {
-                // Clean up expired session
-                if (sessionData.sessionToken) {
-                    tokenToSessionMap.delete(sessionData.sessionToken);
-                }
-                sessionStore.delete(sessionId);
-                cleanedCount++;
-                console.log(`Cleaned up expired session: ${sessionId}`);
-            }
-        }
-
-        if (cleanedCount > 0) {
-            console.log(`Session cleanup completed: removed ${cleanedCount} expired sessions`);
-        }
-    }, 30 * 60 * 1000); // 30 minutes
-}
+// Session cleanup is now handled by SessionAwareTransportManager
 
 // Helper function to get transport session ID from request context
 function getTransportSessionId(): string | undefined {
     const requestContext = requestContextStorage.getStore();
     return requestContext?.mcpSessionId;
+}
+
+// Helper function to get current session context from transport manager
+function getCurrentSessionContext(): RequestContext | undefined {
+    return transportManager?.getCurrentRequestContext();
 }
 
 // Helper function to get or create session ID
@@ -598,21 +583,23 @@ async function getSessionOAuthClient(sessionId: string): Promise<OAuth2Client | 
     return await loadCredentials(undefined, sessionId);
 }
 
-// Proper MCP SDK HTTP/SSE transport implementation
-async function startHttpServer(mcpServer: Server, transportMode: 'http' | 'sse') {
+// Session-aware HTTP/SSE transport implementation
+async function startHttpServer(baseServerConfig: { name: string; version: string }, serverCapabilities: any, toolHandlers: Map<any, (request: any, extra?: any) => Promise<any>>, transportMode: 'http' | 'sse') {
     const app = express();
     app.use(express.json());
 
     console.log(`Starting Gmail MCP Server with ${transportMode.toUpperCase()} transport...`);
+    
+    // Initialize the global transport manager
+    transportManager = new SessionAwareTransportManager();
 
-    // Store transports for session management
+    // Store transports for session management (legacy SSE support)
     const transports = {
-        streamable: {} as Record<string, StreamableHTTPServerTransport>,
         sse: {} as Record<string, SSEServerTransport>
     };
 
     if (transportMode === 'http') {
-        // Modern Streamable HTTP endpoint with proper session management following MCP SDK best practices
+        // Modern Streamable HTTP endpoint with session-aware transport management
         app.all('/mcp', async (req, res) => {
             try {
                 // Set CORS headers
@@ -621,106 +608,59 @@ async function startHttpServer(mcpServer: Server, transportMode: 'http' | 'sse')
                 res.header('Access-Control-Allow-Headers', 'Content-Type, mcp-session-id');
 
                 const sessionId = req.headers['mcp-session-id'] as string | undefined;
-                let transport: StreamableHTTPServerTransport;
+                const isInitRequest = !sessionId && req.method === 'POST' && isInitializeRequest(req.body);
+                
+                console.log(`🌐 Incoming request - Session ID: ${sessionId || 'none'}, Method: ${req.method}, Init: ${isInitRequest}`);
 
-                if (sessionId && transports.streamable[sessionId]) {
-                    // Reuse existing transport
-                    transport = transports.streamable[sessionId];
-                } else if (!sessionId && req.method === 'POST' && isInitializeRequest(req.body)) {
-                    // New initialization request - create isolated transport per session
-                    const newSessionId = randomUUID();
-                    console.log(`🆕 Creating new transport for session: ${newSessionId}`);
-                    
-                    transport = new StreamableHTTPServerTransport({
-                        sessionIdGenerator: () => newSessionId,
-                        onsessioninitialized: (sessionId: string) => {
-                            transports.streamable[sessionId] = transport;
-                            console.log(`✅ New session initialized: ${sessionId}`);
-                            console.log(`📊 Active transports: ${Object.keys(transports.streamable).length}`);
-                        }
-                    });
-
-                    // Clean up transport when closed
-                    transport.onclose = () => {
-                        if (transport.sessionId) {
-                            const authSessionId = 'auth-' + transport.sessionId;
-                            // Clean up auth session data and tokens
-                            const sessionData = sessionStore.get(authSessionId);
-                            if (sessionData?.sessionToken) {
-                                tokenToSessionMap.delete(sessionData.sessionToken);
-                                console.log(`🧹 Cleaned up token for session: ${authSessionId}`);
-                            }
-                            sessionStore.delete(authSessionId);
-                            delete transports.streamable[transport.sessionId];
-                            console.log(`🔒 MCP session closed: ${transport.sessionId}, cleaned auth session: ${authSessionId}`);
-                            console.log(`📊 Remaining active transports: ${Object.keys(transports.streamable).length}`);
-                        }
-                    };
-
-                    // Connect the server to the transport - CRITICAL: Each session gets its own server connection
-                    await mcpServer.connect(transport);
-                    console.log(`🔗 Connected MCP server to new transport: ${newSessionId}`);
-                } else if (req.method === 'POST') {
-                    // POST request without session ID for non-initialize requests
+                // Validate request
+                if (req.method === 'POST' && !isInitRequest && !sessionId) {
                     res.status(400).json({
                         jsonrpc: '2.0',
                         error: {
                             code: -32000,
                             message: 'Bad Request: Session ID required for non-initialize requests',
                         },
-                        id: req.body.id || null,
+                        id: req.body?.id || null,
                     });
                     return;
-                } else {
-                    // Other methods (GET/DELETE) require session ID
-                    if (!sessionId || !transports.streamable[sessionId]) {
-                        res.status(400).send('Invalid or missing session ID');
-                        return;
-                    }
-                    transport = transports.streamable[sessionId];
+                }
+                
+                if ((req.method === 'GET' || req.method === 'DELETE') && !sessionId) {
+                    res.status(400).send('Invalid or missing session ID');
+                    return;
                 }
 
-                // Get session context BEFORE handling request
-                const mcpSessionId = transport.sessionId || sessionId || 'default';
-                const authSessionId = 'auth-' + mcpSessionId;
+                // Get or create session using the transport manager
+                const { sessionData, isNewSession } = await transportManager.getOrCreateSession(
+                    sessionId,
+                    req,
+                    res,
+                    isInitRequest,
+                    baseServerConfig,
+                    serverCapabilities,
+                    toolHandlers
+                );
 
-                console.log(`🌐 HTTP Request - MCP Session: ${mcpSessionId}, Auth Session: ${authSessionId}`);
-                console.log(`🌐 Transport Session ID: ${transport.sessionId}`);
-                console.log(`🌐 Request Session ID: ${sessionId}`);
-                console.log(`🌐 Method: ${req.method}, URL: ${req.url}`);
+                console.log(`🔄 Session management result:`);
+                console.log(`   Session ID: ${sessionData.sessionId}`);
+                console.log(`   Auth Session ID: ${sessionData.authSessionId}`);
+                console.log(`   Is New: ${isNewSession}`);
+                console.log(`   Request Count: ${sessionData.requestCount}`);
 
-                // CRITICAL FIX: Use AsyncLocalStorage to completely isolate each request
-                await requestContextStorage.run({ mcpSessionId, authSessionId }, async () => {
-                    try {
-                        // Direct transport handling without timeout to avoid race conditions
-                        await transport.handleRequest(req, res, req.body);
-                        console.log(`✅ HTTP Request completed for session ${mcpSessionId}`);
-                    } catch (error) {
-                        console.error(`❌ HTTP Request failed for session ${mcpSessionId}:`, error);
-                        // Only send error response if headers haven't been sent
-                        if (!res.headersSent) {
-                            res.status(500).json({
-                                jsonrpc: '2.0',
-                                error: {
-                                    code: -32603,
-                                    message: 'Internal server error',
-                                },
-                                id: req.body?.id || null,
-                            });
-                        }
-                    }
-                });
+                // Handle the request within the session-aware context
+                await transportManager.handleSessionRequest(sessionData, req, res, req.body);
 
             } catch (error: any) {
-                console.error('Error handling Streamable HTTP request:', error);
+                console.error('❌ Error in session-aware HTTP handler:', error);
                 if (!res.headersSent) {
                     res.status(500).json({
                         jsonrpc: '2.0',
                         error: {
                             code: -32603,
-                            message: 'Internal server error',
+                            message: 'Internal server error in session management',
+                            data: { error: error.message }
                         },
-                        id: null,
+                        id: req.body?.id || null,
                     });
                 }
             }
@@ -731,6 +671,14 @@ async function startHttpServer(mcpServer: Server, transportMode: 'http' | 'sse')
         // Legacy SSE endpoint for backwards compatibility
         app.get('/sse', async (req, res) => {
             try {
+                // Create a temporary MCP server for SSE (legacy mode)
+                const mcpServer = new Server(baseServerConfig, serverCapabilities);
+                
+                // Register all tool handlers
+                for (const [schema, handler] of toolHandlers) {
+                    mcpServer.setRequestHandler(schema, handler);
+                }
+                
                 const transport = new SSEServerTransport('/messages', res);
                 transports.sse[transport.sessionId] = transport;
 
@@ -772,18 +720,49 @@ async function startHttpServer(mcpServer: Server, transportMode: 'http' | 'sse')
         res.sendStatus(200);
     });
 
-    // Health check endpoint
+    // Health check endpoint with session statistics
     app.get('/health', (req, res) => {
+        const sessionStats = transportManager ? transportManager.getSessionStats() : { totalSessions: 0, sessions: [] };
+        
         res.json({
             status: 'ok',
             transport: transportMode,
             timestamp: new Date().toISOString(),
             version: '1.1.10',
             activeSessions: {
-                streamable: Object.keys(transports.streamable).length,
-                sse: Object.keys(transports.sse).length
+                streamable: sessionStats.totalSessions,
+                sse: Object.keys(transports.sse).length,
+                details: sessionStats.sessions
             }
         });
+    });
+    
+    // Session management endpoint
+    app.get('/sessions', (req, res) => {
+        if (!transportManager) {
+            res.status(503).json({ error: 'Transport manager not initialized' });
+            return;
+        }
+        
+        const stats = transportManager.getSessionStats();
+        res.json(stats);
+    });
+    
+    // Session cleanup endpoint
+    app.delete('/sessions/:sessionId', async (req, res) => {
+        if (!transportManager) {
+            res.status(503).json({ error: 'Transport manager not initialized' });
+            return;
+        }
+        
+        const sessionId = req.params.sessionId;
+        const success = await transportManager.closeSession(sessionId);
+        
+        if (success) {
+            res.json({ message: `Session ${sessionId} closed successfully` });
+        } else {
+            res.status(404).json({ error: `Session ${sessionId} not found` });
+        }
     });
 
     // API documentation endpoint
@@ -841,9 +820,6 @@ async function main() {
 
     // No global Gmail API initialization - will be done per session
 
-    // Start session cleanup timer
-    startSessionCleanup();
-
     // Server implementation
     const mcpServer = new Server({
         name: "gmail",
@@ -854,8 +830,8 @@ async function main() {
         },
     });
 
-    // Tool handlers
-    mcpServer.setRequestHandler(ListToolsRequestSchema, async () => ({
+    // Create the list tools handler
+    const listToolsHandler = async () => ({
         tools: [
             {
                 name: "send_email",
@@ -948,18 +924,37 @@ async function main() {
                 inputSchema: zodToJsonSchema(AuthenticateWithTokenSchema),
             },
         ],
-    }))
+    });
 
-    mcpServer.setRequestHandler(CallToolRequestSchema, async (request: any, extra?: any) => {
-        console.log(`🔧 Tool request received: ${request.params.name}`);
-        console.log(`🆔 Request ID: ${request.id}`);
-        
-        const startTime = Date.now();
-        // Get the MCP session ID from AsyncLocalStorage context
-        // This ensures proper session isolation per request
-        const requestContext = requestContextStorage.getStore();
-        const mcpSessionId = requestContext?.mcpSessionId || 'default';
-        const authSessionId = requestContext?.authSessionId || ('auth-' + mcpSessionId);
+    // Register the list tools handler on the base server
+    mcpServer.setRequestHandler(ListToolsRequestSchema, listToolsHandler);
+
+    // Create session-aware tool handler factory
+    const createToolHandler = () => {
+        return async (request: any, extra?: any) => {
+            console.log(`🔧 Tool request received: ${request.params.name}`);
+            console.log(`🆔 Request ID: ${request.id}`);
+            
+            const startTime = Date.now();
+            
+            // Get session context from the session-aware transport manager
+            const sessionContext = getCurrentSessionContext();
+            
+            let mcpSessionId: string;
+            let authSessionId: string;
+            
+            if (sessionContext) {
+                // Use context from session-aware transport
+                mcpSessionId = sessionContext.sessionId;
+                authSessionId = sessionContext.authSessionId;
+                console.log(`🔄 Using session-aware context - MCP: ${mcpSessionId}, Auth: ${authSessionId}`);
+            } else {
+                // Fallback to legacy context (for SSE mode)
+                const requestContext = requestContextStorage.getStore();
+                mcpSessionId = requestContext?.mcpSessionId || 'default';
+                authSessionId = requestContext?.authSessionId || ('auth-' + mcpSessionId);
+                console.log(`🔄 Using fallback context - MCP: ${mcpSessionId}, Auth: ${authSessionId}`);
+            }
 
         console.log(`🔄 Processing request for MCP session: ${mcpSessionId}, Auth session: ${authSessionId}`);
         console.log(`📊 Current session store state:`, Array.from(sessionStore.keys()));
@@ -989,16 +984,19 @@ async function main() {
             console.log(`❌ No existing session data found for ${authSessionId}`);
         }
 
-        return asyncLocalStorage.run(initialContext, async () => {
-            const { name, arguments: args } = request.params;
-            
-            // Get preserved request context for this tool execution
-            const toolContext = requestContextStorage.getStore();
+            return asyncLocalStorage.run(initialContext, async () => {
+                const { name, arguments: args } = request.params;
+                
+                // Get preserved request context for this tool execution
+                const toolContext = sessionContext || requestContextStorage.getStore();
             
             console.log(`🛠️ Tool '${name}' starting execution in context:`, JSON.stringify({
                 mcpSessionId,
                 authSessionId, 
-                toolContext: toolContext ? { mcpSessionId: toolContext.mcpSessionId, authSessionId: toolContext.authSessionId } : null,
+                toolContext: toolContext ? { 
+                    sessionId: 'sessionId' in toolContext ? toolContext.sessionId : (toolContext as any).mcpSessionId,
+                    authSessionId: 'authSessionId' in toolContext ? toolContext.authSessionId : (toolContext as any).authSessionId 
+                } : null,
                 hasInitialContext: !!initialContext,
                 requestId: request.id
             }));
@@ -1125,7 +1123,9 @@ async function main() {
                             });
 
                             console.log(`📧 Email sent successfully with ID: ${result.data.id} for session ${authSessionId}`);
-                            console.log(`🔄 About to return response for session ${authSessionId}, tool context: ${JSON.stringify(toolContext)}`);
+                            console.log(`🔄 About to return response for session ${authSessionId}`);
+                            console.log(`🔄 Session context available: ${!!sessionContext}`);
+                            console.log(`🔄 Request ID: ${sessionContext?.requestId || request.id}`);
                             return {
                                 content: [
                                     {
@@ -2005,28 +2005,76 @@ async function main() {
                         },
                     ],
                 };
-            } finally {
-                const duration = Date.now() - startTime;
-                console.log(`⏱️ Tool execution completed: ${request.params.name} (${duration}ms) - Request ID: ${request.id}`);
-                console.log(`⏱️ Final context check - MCP: ${mcpSessionId}, Auth: ${authSessionId}`);
-            }
-        });
-    });
+                } finally {
+                    const duration = Date.now() - startTime;
+                    console.log(`⏱️ Tool execution completed: ${request.params.name} (${duration}ms) - Request ID: ${request.id}`);
+                    console.log(`⏱️ Final context check - MCP: ${mcpSessionId}, Auth: ${authSessionId}`);
+                    console.log(`⏱️ Session context preserved: ${!!sessionContext}`);
+                }
+            });
+        };
+    };
+    
+    // Create the tool handler function
+    const toolHandler = createToolHandler();
+    
+    // Register the tool handler on the base server (for stdio and legacy modes)
+    mcpServer.setRequestHandler(CallToolRequestSchema, toolHandler);
+    // Collect all tool handlers into a map for the session-aware transport
+    const toolHandlers = new Map<any, (request: any, extra?: any) => Promise<any>>();
+    toolHandlers.set(ListToolsRequestSchema, listToolsHandler);
+    toolHandlers.set(CallToolRequestSchema, toolHandler);
+    
     // Determine transport mode from command line arguments
     const transportMode = process.argv.includes('--http') ? 'http' :
         process.argv.includes('--sse') ? 'sse' : 'stdio';
 
     if (transportMode === 'stdio') {
-        // Default stdio transport
+        // Default stdio transport - single session mode
         const transport = new StdioServerTransport();
         await mcpServer.connect(transport);
+        console.log('Gmail MCP Server started in stdio mode');
     } else {
-        // HTTP or SSE transport - start Express server
-        await startHttpServer(mcpServer, transportMode as 'http' | 'sse');
+        // HTTP or SSE transport - multi-session mode with session-aware transport
+        await startHttpServer(
+            { name: "gmail", version: "1.0.0" },
+            { capabilities: { tools: {} } },
+            toolHandlers,
+            transportMode as 'http' | 'sse'
+        );
     }
 }
 
-main().catch((error) => {
+main().catch(async (error) => {
     console.error('Server error:', error);
+    
+    // Cleanup transport manager on exit
+    if (transportManager) {
+        await transportManager.destroy();
+    }
+    
     process.exit(1);
+});
+
+// Graceful shutdown handling
+process.on('SIGINT', async () => {
+    console.log('\n📴 Received SIGINT, shutting down gracefully...');
+    
+    if (transportManager) {
+        await transportManager.destroy();
+        console.log('🧹 Transport manager cleaned up');
+    }
+    
+    process.exit(0);
+});
+
+process.on('SIGTERM', async () => {
+    console.log('\n📴 Received SIGTERM, shutting down gracefully...');
+    
+    if (transportManager) {
+        await transportManager.destroy();
+        console.log('🧹 Transport manager cleaned up');
+    }
+    
+    process.exit(0);
 });
