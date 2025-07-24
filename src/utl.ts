@@ -42,9 +42,20 @@ export function createEmailMessage(validatedArgs: any): string {
         }
     });
 
+    // Format the From header with optional display name
+    const formatFromAddress = () => {
+        const email = validatedArgs.from || 'me';
+        if (validatedArgs.fromName) {
+            // Encode display name if it contains non-ASCII characters
+            const encodedName = encodeEmailHeader(validatedArgs.fromName);
+            return `${encodedName} <${email}>`;
+        }
+        return email;
+    };
+
     // Common email headers
     const emailParts = [
-        'From: me',
+        `From: ${formatFromAddress()}`,
         `To: ${validatedArgs.to.join(', ')}`,
         validatedArgs.cc ? `Cc: ${validatedArgs.cc.join(', ')}` : '',
         validatedArgs.bcc ? `Bcc: ${validatedArgs.bcc.join(', ')}` : '',
@@ -127,8 +138,17 @@ export async function createEmailWithNodemailer(validatedArgs: any): Promise<str
         });
     }
 
+    // Format the From field with optional display name for Nodemailer
+    const formatFromForNodemailer = () => {
+        const email = validatedArgs.from || 'me';
+        if (validatedArgs.fromName) {
+            return `${validatedArgs.fromName} <${email}>`;
+        }
+        return email;
+    };
+
     const mailOptions = {
-        from: 'me', // Gmail API will replace this with the authenticated user
+        from: formatFromForNodemailer(), // Use specified from address with optional display name
         to: validatedArgs.to.join(', '),
         cc: validatedArgs.cc?.join(', '),
         bcc: validatedArgs.bcc?.join(', '),

@@ -149,7 +149,10 @@ async function authenticate() {
     return new Promise<void>((resolve, reject) => {
         const authUrl = oauth2Client.generateAuthUrl({
             access_type: 'offline',
-            scope: ['https://www.googleapis.com/auth/gmail.modify'],
+            scope: [
+                'https://www.googleapis.com/auth/gmail.modify',
+                'https://www.googleapis.com/auth/gmail.settings.basic'
+            ],
         });
 
         console.log('Please visit this URL to authenticate:', authUrl);
@@ -195,6 +198,8 @@ const SendEmailSchema = z.object({
     mimeType: z.enum(['text/plain', 'text/html', 'multipart/alternative']).optional().default('text/plain').describe("Email content type"),
     cc: z.array(z.string()).optional().describe("List of CC recipients"),
     bcc: z.array(z.string()).optional().describe("List of BCC recipients"),
+    from: z.string().optional().describe("Email address to send from (must be a verified alias). If not specified, uses the primary email address"),
+    fromName: z.string().optional().describe("Display name to use with the from address (e.g., 'John Doe'). If not specified, uses the alias default display name"),
     threadId: z.string().optional().describe("Thread ID to reply to"),
     inReplyTo: z.string().optional().describe("Message ID being replied to"),
     attachments: z.array(z.string()).optional().describe("List of file paths to attach to the email"),
@@ -267,6 +272,8 @@ const DownloadAttachmentSchema = z.object({
     filename: z.string().optional().describe("Filename to save the attachment as (if not provided, uses original filename)"),
     savePath: z.string().optional().describe("Directory path to save the attachment (defaults to current directory)"),
 });
+
+const ListSendAsAliasesSchema = z.object({}).describe("Retrieves all verified send-as aliases for the authenticated user");
 
 // Main function
 async function main() {
@@ -362,6 +369,11 @@ async function main() {
                 name: "download_attachment",
                 description: "Downloads an email attachment to a specified location",
                 inputSchema: zodToJsonSchema(DownloadAttachmentSchema),
+            },
+            {
+                name: "list_send_as_aliases",
+                description: "Lists all verified send-as aliases for the authenticated user",
+                inputSchema: zodToJsonSchema(ListSendAsAliasesSchema),
             },
         ],
     }))
@@ -952,6 +964,48 @@ async function main() {
                                 {
                                     type: "text",
                                     text: `Failed to download attachment: ${error.message}`,
+                                },
+                            ],
+                        };
+                    }
+                }
+
+                case "list_send_as_aliases": {
+                    try {
+                        const response = await gmail.users.settings.sendAs.list({
+                            userId: 'me',
+                        });
+
+                        const aliases = response.data.sendAs || [];
+                        
+                        // Sort aliases with primary first
+                        const sortedAliases = aliases.sort((a, b) => {
+                            if (a.isPrimary) return -1;
+                            if (b.isPrimary) return 1;
+                            return 0;
+                        });
+
+                        const aliasInfo = sortedAliases.map(alias => {
+                            const status = alias.verificationStatus === 'accepted' ? 'Verified' : 
+                                          alias.verificationStatus === 'pending' ? 'Pending' : 'Unverified';
+                            const primary = alias.isPrimary ? ' (Primary)' : '';
+                            return `Email: ${alias.sendAsEmail}${primary}\nDisplay Name: ${alias.displayName || 'Not set'}\nStatus: ${status}\nDefault: ${alias.isDefault ? 'Yes' : 'No'}\n`;
+                        }).join('\n');
+
+                        return {
+                            content: [
+                                {
+                                    type: "text",
+                                    text: `Found ${aliases.length} send-as alias${aliases.length !== 1 ? 'es' : ''}:\n\n${aliasInfo}`,
+                                },
+                            ],
+                        };
+                    } catch (error: any) {
+                        return {
+                            content: [
+                                {
+                                    type: "text",
+                                    text: `Failed to retrieve send-as aliases: ${error.message}`,
                                 },
                             ],
                         };
