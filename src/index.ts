@@ -2081,7 +2081,7 @@ async function main() {
         // Default stdio transport - single session mode
         const transport = new StdioServerTransport();
         await mcpServer.connect(transport);
-        console.log('Gmail MCP Server started in stdio mode');
+        // Removed console.log to prevent JSON-RPC stream pollution
     } else {
         // HTTP or SSE transport - multi-session mode with session-aware transport
         await startHttpServer(
