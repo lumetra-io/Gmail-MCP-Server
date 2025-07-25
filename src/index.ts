@@ -136,6 +136,7 @@ async function loadCredentials(storagePath?: string, sessionId?: string): Promis
     }
 
     try {
+<<<<<<< HEAD
         // Create config directory if it doesn't exist
         if (!fs.existsSync(CONFIG_DIR)) {
             fs.mkdirSync(CONFIG_DIR, { recursive: true });
@@ -174,10 +175,98 @@ async function loadCredentials(storagePath?: string, sessionId?: string): Promis
             clientSecret: keys.client_secret,
             redirectUri: callback
         });
+=======
+        // Determine account prefix for multi-account support
+        const accountPrefix = process.env.GMAIL_ACCOUNT_PREFIX || '';
+        const envPrefix = accountPrefix ? `GMAIL_${accountPrefix}_` : 'GMAIL_';
 
-        if (fs.existsSync(CREDENTIALS_PATH)) {
+        // Try to load OAuth client configuration from environment variables first
+        let clientId = process.env[`${envPrefix}CLIENT_ID`];
+        let clientSecret = process.env[`${envPrefix}CLIENT_SECRET`];
+        let redirectUri = process.env[`${envPrefix}REDIRECT_URI`] || "http://localhost:3000/oauth2callback";
+
+        // If env vars not available, fall back to file-based configuration
+        if (!clientId || !clientSecret) {
+            console.log('OAuth client config not found in environment variables, falling back to file-based configuration...');
+            
+            // Create config directory if it doesn't exist
+            if (!process.env.GMAIL_OAUTH_PATH && !CREDENTIALS_PATH && !fs.existsSync(CONFIG_DIR)) {
+                fs.mkdirSync(CONFIG_DIR, { recursive: true });
+            }
+
+            // Check for OAuth keys in current directory first, then in config directory
+            const localOAuthPath = path.join(process.cwd(), 'gcp-oauth.keys.json');
+
+            if (fs.existsSync(localOAuthPath)) {
+                // If found in current directory, copy to config directory
+                fs.copyFileSync(localOAuthPath, OAUTH_PATH);
+                console.log('OAuth keys found in current directory, copied to global config.');
+            }
+
+            if (!fs.existsSync(OAUTH_PATH)) {
+                console.error('Error: OAuth configuration not found. Please provide either:');
+                console.error('  1. Environment variables: GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET');
+                console.error('  2. OAuth keys file: gcp-oauth.keys.json in current directory or', CONFIG_DIR);
+                process.exit(1);
+            }
+
+            const keysContent = JSON.parse(fs.readFileSync(OAUTH_PATH, 'utf8'));
+            const keys = keysContent.installed || keysContent.web;
+
+            if (!keys) {
+                console.error('Error: Invalid OAuth keys file format. File should contain either "installed" or "web" credentials.');
+                process.exit(1);
+            }
+
+            clientId = keys.client_id;
+            clientSecret = keys.client_secret;
+            
+            // Use callback from command line args if provided
+            const callback = process.argv[2] === 'auth' && process.argv[3] 
+                ? process.argv[3] 
+                : "http://localhost:3000/oauth2callback";
+            redirectUri = callback;
+        } else {
+            console.log(`Loading OAuth configuration from environment variables (account: ${accountPrefix || 'default'})...`);
+        }
+
+        // Initialize OAuth2 client
+        oauth2Client = new OAuth2Client(
+            clientId,
+            clientSecret,
+            redirectUri
+        );
+>>>>>>> 090af74 (.)
+
+        // Try to load user credentials from environment variables first
+        const accessToken = process.env[`${envPrefix}ACCESS_TOKEN`];
+        const refreshToken = process.env[`${envPrefix}REFRESH_TOKEN`];
+        const expiryDate = process.env[`${envPrefix}EXPIRY_DATE`];
+
+        if (accessToken && refreshToken) {
+            console.log(`Loading user credentials from environment variables (account: ${accountPrefix || 'default'})...`);
+            const credentials: any = {
+                access_token: accessToken,
+                refresh_token: refreshToken,
+                token_type: 'Bearer',
+                scope: 'https://www.googleapis.com/auth/gmail.modify'
+            };
+            
+            if (expiryDate) {
+                credentials.expiry_date = parseInt(expiryDate);
+            }
+            
+            oauth2Client.setCredentials(credentials);
+        } else if (fs.existsSync(CREDENTIALS_PATH)) {
+            console.log('Loading user credentials from file...');
             const credentials = JSON.parse(fs.readFileSync(CREDENTIALS_PATH, 'utf8'));
+<<<<<<< HEAD
             sessionOauth2Client.setCredentials(credentials);
+=======
+            oauth2Client.setCredentials(credentials);
+        } else {
+            console.log('No user credentials found. Authentication will be required.');
+>>>>>>> 090af74 (.)
         }
 
         return sessionOauth2Client;
