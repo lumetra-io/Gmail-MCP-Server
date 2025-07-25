@@ -136,46 +136,7 @@ async function loadCredentials(storagePath?: string, sessionId?: string): Promis
     }
 
     try {
-<<<<<<< HEAD
-        // Create config directory if it doesn't exist
-        if (!fs.existsSync(CONFIG_DIR)) {
-            fs.mkdirSync(CONFIG_DIR, { recursive: true });
-        }
 
-        // Check for OAuth keys in current directory first, then in config directory
-        const localOAuthPath = path.join(process.cwd(), 'gcp-oauth.keys.json');
-
-        if (fs.existsSync(localOAuthPath) && !fs.existsSync(OAUTH_PATH)) {
-            // If found in current directory and not in config, copy to config directory
-            fs.copyFileSync(localOAuthPath, OAUTH_PATH);
-            console.log('OAuth keys found in current directory, copied to global config.');
-        }
-
-        if (!fs.existsSync(OAUTH_PATH)) {
-            // Don't exit if the file doesn't exist, just warn
-            console.warn(`Warning: OAuth keys file not found for session ${sessionId || 'default'}. Please run the setup_authentication tool.`);
-            return null; // Return null instead of undefined
-        }
-
-        const keysContent = JSON.parse(fs.readFileSync(OAUTH_PATH, 'utf8'));
-        const keys = keysContent.installed || keysContent.web;
-
-        if (!keys) {
-            console.error('Error: Invalid OAuth keys file format. File should contain either "installed" or "web" credentials.');
-            return null; // Return null instead of undefined
-        }
-
-        // Use the first redirect URI from the stored configuration, or command line override
-        const callback = process.argv[2] === 'auth' && process.argv[3]
-            ? process.argv[3]
-            : (keys.redirect_uris && keys.redirect_uris[0]) || "http://localhost:3456/oauth2callback";
-
-        const sessionOauth2Client = new OAuth2Client({
-            clientId: keys.client_id,
-            clientSecret: keys.client_secret,
-            redirectUri: callback
-        });
-=======
         // Determine account prefix for multi-account support
         const accountPrefix = process.env.GMAIL_ACCOUNT_PREFIX || '';
         const envPrefix = accountPrefix ? `GMAIL_${accountPrefix}_` : 'GMAIL_';
@@ -236,7 +197,6 @@ async function loadCredentials(storagePath?: string, sessionId?: string): Promis
             clientSecret,
             redirectUri
         );
->>>>>>> 090af74 (.)
 
         // Try to load user credentials from environment variables first
         const accessToken = process.env[`${envPrefix}ACCESS_TOKEN`];
@@ -260,13 +220,9 @@ async function loadCredentials(storagePath?: string, sessionId?: string): Promis
         } else if (fs.existsSync(CREDENTIALS_PATH)) {
             console.log('Loading user credentials from file...');
             const credentials = JSON.parse(fs.readFileSync(CREDENTIALS_PATH, 'utf8'));
-<<<<<<< HEAD
-            sessionOauth2Client.setCredentials(credentials);
-=======
             oauth2Client.setCredentials(credentials);
         } else {
             console.log('No user credentials found. Authentication will be required.');
->>>>>>> 090af74 (.)
         }
 
         return sessionOauth2Client;
