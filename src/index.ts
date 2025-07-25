@@ -27,6 +27,9 @@ import { createLabel, updateLabel, deleteLabel, listLabels, findLabelByName, get
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { SessionAwareTransportManager, RequestContext } from './session-aware-transport.js';
 
+// Global OAuth2 client variable
+let oauth2Client: OAuth2Client;
+
 // Define the shape of the context for each request
 interface AppContext {
     gmail: gmail_v1.Gmail | null;
@@ -225,7 +228,7 @@ async function loadCredentials(storagePath?: string, sessionId?: string): Promis
             console.log('No user credentials found. Authentication will be required.');
         }
 
-        return sessionOauth2Client;
+        return oauth2Client;
     } catch (error) {
         console.error('Error loading credentials:', error);
         return null;
